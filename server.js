@@ -1,56 +1,4 @@
-const { WebSocketServer } = require('ws');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT });
-const clients = new Set();
-
-const DB_PATH = path.join(__dirname, 'users.json');
-
-console.log(`🚀 Сервер с верификацией кодов запущен на порту ${PORT}`);
-
-// Временное хранилище сгенерированных кодов подтверждения (e-mail -> { code, expires })
-const verificationCodes = new Map();
-
-function loadUsers() {
-    if (!fs.existsSync(DB_PATH)) {
-        fs.writeFileSync(DB_PATH, JSON.stringify({}));
-    }
-    try {
-        const data = fs.readFileSync(DB_PATH, 'utf8');
-        return JSON.parse(data);
-    } catch (e) {
-        return {};
-    }
-}
-
-function saveUsers(users) {
-    fs.writeFileSync(DB_PATH, JSON.stringify(users, null, 2));
-}
-
-function hashPassword(password) {
-    return crypto.createHash('sha256').update(password).digest('hex');
-}
-
-function isValidEmail(email) {
-    const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    return re.test(email);
-}
-
-wss.on('connection', (ws) => {
-    clients.add(ws);
-    ws.isAuthenticated = false;
-    ws.username = null;
-    ws.email = null;
-
-    ws.on('message', (messageBuffer) => {
-        try {
-            const data = JSON.parse(messageBuffer.toString());
-            const users = loadUsers();
-
-            // --- 1. ЗАПРОС КОДА ПОДТВЕРЖДЕНИЯ (ДЛЯ РЕГИСТРАЦИИ) ---
+            // --- 1. ЗАПРОС КОДА ПОДТВЕРЖДЕНИЯ ---
             if (data.type === 'request_code') {
                 const email = data.email?.trim().toLowerCase();
                 
@@ -64,122 +12,17 @@ wss.on('connection', (ws) => {
                     return ws.send(JSON.stringify({ type: 'auth_error', error: 'Этот E-mail уже зарегистрирован!' }));
                 }
 
-                // Генерируем случайный 4-значный код
                 const code = Math.floor(1000 + Math.random() * 9000).toString();
                 verificationCodes.set(email, {
                     code: code,
-                    expires: Date.now() + 5 * 60 * 1000 // Код живет 5 минут
+                    expires: Date.now() + 5 * 60 * 1000
                 });
 
-                console.log(`[CODE GEN] Для ${email} сгенерирован код: ${code}`);
+                console.log(`[CODE GEN] Код для ${email}: ${code}`);
 
-                // Отправляем код обратно клиенту (для имитации)
                 return ws.send(JSON.stringify({ 
                     type: 'code_generated', 
                     email: email, 
-                    code: code // В реальном продакшене код уходил бы на почту/СМС, а не в приложение
+                    code: code 
                 }));
             }
-
-            // --- 2. ПОДТВЕРЖДЕНИЕ И РЕГИСТРАЦИЯ ---
-            if (data.type === 'register_verify') {
-                const email = data.email?.trim().toLowerCase();
-                const username = data.username?.trim();
-                const password = data.password;
-                const userCode = data.code?.trim();
-
-                if (!email || !username || !password || !userCode) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Все поля и код обязательны!' }));
-                }
-
-                const savedCodeData = verificationCodes.get(email);
-
-                if (!savedCodeData) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Код не запрашивался или устарел!' }));
-                }
-                if (Date.now() > savedCodeData.expires) {
-                    verificationCodes.delete(email);
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Время действия кода истекло!' }));
-                }
-                if (savedCodeData.code !== userCode) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Неверный код подтверждения!' }));
-                }
-
-                // Если код верный — удаляем его из временных и сохраняем юзера в БД
-                verificationCodes.delete(email);
-
-                users[email] = {
-                    email: email,
-                    username: username,
-                    passwordHash: hashPassword(password),
-                    status: data.status || "Новенький 🚀"
-                };
-                saveUsers(users);
-
-                ws.isAuthenticated = true;
-                ws.username = username;
-                ws.email = email;
-                return ws.send(JSON.stringify({ type: 'auth_success', username: username, status: users[email].status }));
-            }
-
-            // --- 3. ОБЫЧНЫЙ ВХОД (БЕЗ ИЗМЕНЕНИЙ) ---
-            if (data.type === 'login') {
-                const email = data.email?.trim().toLowerCase();
-                const password = data.password;
-
-                if (!email || !password) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Заполните все поля!' }));
-                }
-
-                const user = users[email];
-                if (!user || user.passwordHash !== hashPassword(password)) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Неверная почта или пароль!' }));
-                }
-
-                ws.isAuthenticated = true;
-                ws.username = user.username;
-                ws.email = email;
-                return ws.send(JSON.stringify({ 
-                    type: 'auth_success', 
-                    username: user.username, 
-                    status: user.status 
-                }));
-            }
-
-            // --- ОБРАБОТКА ОБЫЧНЫХ СООБЩЕНИЙ ---
-            if (data.type === 'message') {
-                if (!ws.isAuthenticated) {
-                    return ws.send(JSON.stringify({ type: 'sys_err', text: 'Пожалуйста, сначала авторизуйтесь.' }));
-                }
-
-                let responseData = { ...data };
-                responseData.timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                const broadcastData = JSON.stringify(responseData);
-
-                for (const client of clients) {
-                    if (client.readyState === 1 && client.isAuthenticated) {
-                        client.send(broadcastData);
-                    }
-                }
-                return;
-            }
-
-            // --- ОБРАБОТКА СТАТУСА ПЕЧАТИ ---
-            if (data.type === 'typing') {
-                if (!ws.isAuthenticated) return;
-                
-                const broadcastData = JSON.stringify(data);
-                for (const client of clients) {
-                    if (client.readyState === 1 && client.isAuthenticated) {
-                        client.send(broadcastData);
-                    }
-                }
-            }
-
-        } catch (e) { 
-            console.error('Ошибка обработки сообщения:', e.message); 
-        }
-    });
-
-    ws.on('close', () => clients.delete(ws));
-});
