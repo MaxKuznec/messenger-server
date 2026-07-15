@@ -7,12 +7,13 @@ const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
 const clients = new Set();
 
-// Путь к файлу-базе данных пользователей
 const DB_PATH = path.join(__dirname, 'users.json');
 
-console.log(`🚀 Глобальный защищенный сервер запущен на порту ${PORT}`);
+console.log(`🚀 Сервер с верификацией кодов запущен на порту ${PORT}`);
 
-// Функция чтения пользователей из файла
+// Временное хранилище сгенерированных кодов подтверждения (e-mail -> { code, expires })
+const verificationCodes = new Map();
+
 function loadUsers() {
     if (!fs.existsSync(DB_PATH)) {
         fs.writeFileSync(DB_PATH, JSON.stringify({}));
@@ -25,42 +26,91 @@ function loadUsers() {
     }
 }
 
-// Функция записи пользователей в файл
 function saveUsers(users) {
     fs.writeFileSync(DB_PATH, JSON.stringify(users, null, 2));
 }
 
-// Безопасное хэширование пароля
 function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
 
+function isValidEmail(email) {
+    const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return re.test(email);
+}
+
 wss.on('connection', (ws) => {
     clients.add(ws);
-    ws.isAuthenticated = false; // По умолчанию клиент не авторизован
+    ws.isAuthenticated = false;
     ws.username = null;
+    ws.email = null;
 
     ws.on('message', (messageBuffer) => {
         try {
             const data = JSON.parse(messageBuffer.toString());
             const users = loadUsers();
 
-            // --- ОБРАБОТКА РЕГИСТРАЦИИ ---
-            if (data.type === 'register') {
+            // --- 1. ЗАПРОС КОДА ПОДТВЕРЖДЕНИЯ (ДЛЯ РЕГИСТРАЦИИ) ---
+            if (data.type === 'request_code') {
+                const email = data.email?.trim().toLowerCase();
+                
+                if (!email) {
+                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Укажите E-mail!' }));
+                }
+                if (!isValidEmail(email)) {
+                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Некорректный формат почты!' }));
+                }
+                if (users[email]) {
+                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Этот E-mail уже зарегистрирован!' }));
+                }
+
+                // Генерируем случайный 4-значный код
+                const code = Math.floor(1000 + Math.random() * 9000).toString();
+                verificationCodes.set(email, {
+                    code: code,
+                    expires: Date.now() + 5 * 60 * 1000 // Код живет 5 минут
+                });
+
+                console.log(`[CODE GEN] Для ${email} сгенерирован код: ${code}`);
+
+                // Отправляем код обратно клиенту (для имитации)
+                return ws.send(JSON.stringify({ 
+                    type: 'code_generated', 
+                    email: email, 
+                    code: code // В реальном продакшене код уходил бы на почту/СМС, а не в приложение
+                }));
+            }
+
+            // --- 2. ПОДТВЕРЖДЕНИЕ И РЕГИСТРАЦИЯ ---
+            if (data.type === 'register_verify') {
+                const email = data.email?.trim().toLowerCase();
                 const username = data.username?.trim();
                 const password = data.password;
+                const userCode = data.code?.trim();
 
-                if (!username || !password) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Заполните все поля!' }));
+                if (!email || !username || !password || !userCode) {
+                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Все поля и код обязательны!' }));
                 }
 
-                if (users[username.toLowerCase()]) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Этот никнейм уже занят!' }));
+                const savedCodeData = verificationCodes.get(email);
+
+                if (!savedCodeData) {
+                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Код не запрашивался или устарел!' }));
+                }
+                if (Date.now() > savedCodeData.expires) {
+                    verificationCodes.delete(email);
+                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Время действия кода истекло!' }));
+                }
+                if (savedCodeData.code !== userCode) {
+                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Неверный код подтверждения!' }));
                 }
 
-                // Сохраняем нового пользователя
-                users[username.toLowerCase()] = {
-                    originalName: username,
+                // Если код верный — удаляем его из временных и сохраняем юзера в БД
+                verificationCodes.delete(email);
+
+                users[email] = {
+                    email: email,
+                    username: username,
                     passwordHash: hashPassword(password),
                     status: data.status || "Новенький 🚀"
                 };
@@ -68,35 +118,36 @@ wss.on('connection', (ws) => {
 
                 ws.isAuthenticated = true;
                 ws.username = username;
-                return ws.send(JSON.stringify({ type: 'auth_success', username: username }));
+                ws.email = email;
+                return ws.send(JSON.stringify({ type: 'auth_success', username: username, status: users[email].status }));
             }
 
-            // --- ОБРАБОТКА ВХОДА ---
+            // --- 3. ОБЫЧНЫЙ ВХОД (БЕЗ ИЗМЕНЕНИЙ) ---
             if (data.type === 'login') {
-                const username = data.username?.trim();
+                const email = data.email?.trim().toLowerCase();
                 const password = data.password;
 
-                if (!username || !password) {
+                if (!email || !password) {
                     return ws.send(JSON.stringify({ type: 'auth_error', error: 'Заполните все поля!' }));
                 }
 
-                const user = users[username.toLowerCase()];
+                const user = users[email];
                 if (!user || user.passwordHash !== hashPassword(password)) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Неверный никнейм или пароль!' }));
+                    return ws.send(JSON.stringify({ type: 'auth_error', error: 'Неверная почта или пароль!' }));
                 }
 
                 ws.isAuthenticated = true;
-                ws.username = user.originalName;
+                ws.username = user.username;
+                ws.email = email;
                 return ws.send(JSON.stringify({ 
                     type: 'auth_success', 
-                    username: user.originalName, 
+                    username: user.username, 
                     status: user.status 
                 }));
             }
 
             // --- ОБРАБОТКА ОБЫЧНЫХ СООБЩЕНИЙ ---
             if (data.type === 'message') {
-                // Блокируем сообщения от неавторизованных сессий
                 if (!ws.isAuthenticated) {
                     return ws.send(JSON.stringify({ type: 'sys_err', text: 'Пожалуйста, сначала авторизуйтесь.' }));
                 }
@@ -105,7 +156,6 @@ wss.on('connection', (ws) => {
                 responseData.timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
                 const broadcastData = JSON.stringify(responseData);
 
-                // Рассылаем всем авторизованным пользователям
                 for (const client of clients) {
                     if (client.readyState === 1 && client.isAuthenticated) {
                         client.send(broadcastData);
